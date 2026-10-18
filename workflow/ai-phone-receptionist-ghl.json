@@ -1,0 +1,667 @@
+{
+  "name": "AI Phone Receptionist: VAPI + GoHighLevel Booking (v3)",
+  "nodes": [
+    {
+      "id": "wh-001",
+      "name": "VAPI Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        400
+      ],
+      "parameters": {
+        "path": "vapi-ghl-setter",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "set-001",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        500,
+        400
+      ],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cfg-0",
+              "name": "calendarId",
+              "value": "={{$env.GHL_CALENDAR_ID}}",
+              "type": "string"
+            },
+            {
+              "id": "cfg-1",
+              "name": "locationId",
+              "value": "={{$env.GHL_LOCATION_ID}}",
+              "type": "string"
+            },
+            {
+              "id": "cfg-2",
+              "name": "testPhone",
+              "value": "={{$env.TEST_PHONE}}",
+              "type": "string"
+            },
+            {
+              "id": "cfg-3",
+              "name": "timezone",
+              "value": "={{$env.GHL_TIMEZONE}}",
+              "type": "string"
+            },
+            {
+              "id": "cfg-4",
+              "name": "ghlApiKey",
+              "value": "={{$env.GHL_API_KEY}}",
+              "type": "string"
+            },
+            {
+              "id": "cfg-5",
+              "name": "appointmentDuration",
+              "value": 60,
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "include": "all",
+        "options": {}
+      }
+    },
+    {
+      "id": "code-extract",
+      "name": "Extract Tool Call",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        400
+      ],
+      "parameters": {
+        "jsCode": "const body = $input.item.json.body || $input.item.json;\nconst toolCall    = body?.message?.toolCallList?.[0] || body?.toolCallList?.[0] || {};\nconst toolName    = toolCall?.function?.name || '';\nconst args        = toolCall?.function?.arguments || {};\nconst toolCallId  = toolCall?.id || 'unknown';\nconst callerPhone = body?.call?.customer?.number\n                 || body?.customer?.number\n                 || $('Config').item.json.testPhone\n                 || '';\n\n// FIX: normalise requestedTime → ISO string\nconst rawTime = args.requested_time || args.requestedTime || '';\nlet requestedTimeISO;\ntry {\n  const d = new Date(rawTime);\n  if (!isNaN(d.getTime()) && d > new Date()) {\n    requestedTimeISO = d.toISOString();\n  } else throw new Error('invalid or past');\n} catch(e) {\n  const d = new Date();\n  d.setDate(d.getDate() + 1);\n  d.setHours(9, 0, 0, 0);\n  requestedTimeISO = d.toISOString();\n}\n\nreturn [{ json: {\n  toolName,\n  toolCallId,\n  callerPhone,\n  requestedTimeISO,\n  callerName:          args.name           || args.callerName    || 'Unknown',\n  reason:              args.reason         || '',\n  calendarId:          $('Config').item.json.calendarId,\n  locationId:          $('Config').item.json.locationId,\n  timezone:            $('Config').item.json.timezone,\n  ghlApiKey:           $('Config').item.json.ghlApiKey,\n  testPhone:           $('Config').item.json.testPhone,\n  appointmentDuration: $('Config').item.json.appointmentDuration || 60\n}}];"
+      }
+    },
+    {
+      "id": "sw-001",
+      "name": "Which Tool?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1020,
+        400
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.toolName}}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    },
+                    "rightValue": "check"
+                  }
+                ]
+              },
+              "outputKey": "0"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.toolName}}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    },
+                    "rightValue": "book"
+                  }
+                ]
+              },
+              "outputKey": "1"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "code-dates",
+      "name": "Build Date Range",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        180
+      ],
+      "parameters": {
+        "jsCode": "const reqDate = new Date($json.requestedTimeISO);\nconst now     = new Date();\n\n// Floor to 8am if the requested day is today and hour < 8\nif (reqDate.toDateString() === now.toDateString() && reqDate.getHours() < 8) {\n  reqDate.setHours(8, 0, 0, 0);\n}\n\nconst startDate = reqDate.getTime();\nconst endDate   = startDate + (4 * 24 * 60 * 60 * 1000);\n\nreturn [{ json: {\n  ...$json,\n  startDate,\n  endDate,\n  startDateISO: new Date(startDate).toISOString(),\n  endDateISO:   new Date(endDate).toISOString()\n}}];"
+      }
+    },
+    {
+      "id": "http-slots",
+      "name": "GHL: Get Free Slots",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        180
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://services.leadconnectorhq.com/calendars/' + $json.calendarId + '/free-slots?startDate=' + $json.startDate + '&endDate=' + $json.endDate + '&timezone=' + encodeURIComponent($json.timezone) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $json.ghlApiKey }}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "code-format-slots",
+      "name": "Format Slots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        180
+      ],
+      "parameters": {
+        "jsCode": "const data       = $input.item.json;\nconst toolCallId = $('Extract Tool Call').item.json.toolCallId;\nconst MAX_SLOTS  = 5;\nconst tz         = $('Extract Tool Call').item.json.timezone || 'America/New_York';\n\nlet slotLines = [];\ntry {\n  const raw   = data._dates_ || data;\n  const dates = Object.fromEntries(Object.entries(raw).filter(([k]) => /^\\d{4}-\\d{2}-\\d{2}$/.test(k)));\n  for (const [date, dayData] of Object.entries(dates)) {\n    const slots = Array.isArray(dayData) ? dayData : (dayData.slots || []);\n    for (const slot of slots) {\n      if (slotLines.length >= MAX_SLOTS) break;\n      const t = new Date(slot);\n      const label = t.toLocaleString('en-US', {\n        timeZone: tz, weekday: 'short', month: 'short', day: 'numeric',\n        hour: 'numeric', minute: '2-digit', hour12: true\n      });\n      slotLines.push(label);\n    }\n    if (slotLines.length >= MAX_SLOTS) break;\n  }\n} catch(e) {}\n\nconst result = slotLines.length > 0\n  ? 'I have these openings available: ' + slotLines.join(', ') + '. Which works best for you?'\n  : 'I am sorry, there is no availability for that time. Could you suggest a different day?';\n\nreturn [{ json: { toolCallId, result } }];"
+      }
+    },
+    {
+      "id": "resp-slots",
+      "name": "Respond: Slots",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2060,
+        180
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ results: [{ toolCallId: $json.toolCallId, result: $json.result }] }) }}"
+      }
+    },
+    {
+      "id": "http-search",
+      "name": "GHL: Search Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1280,
+        620
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://services.leadconnectorhq.com/contacts/?locationId=' + $json.locationId + '&query=' + encodeURIComponent($json.callerPhone || $json.testPhone) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $json.ghlApiKey }}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "if-contact",
+      "name": "Contact Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        620
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "chk-total",
+              "leftValue": "={{ ($json.contacts || []).length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "code-get-id",
+      "name": "Get Contact ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        500
+      ],
+      "parameters": {
+        "jsCode": "const contacts = $json.contacts || [];\nconst contactId = contacts[0]?.id || '';\nconst ex = $('Extract Tool Call').item.json;\nreturn [{ json: {\n  contactId,\n  callerName:          ex.callerName,\n  requestedTimeISO:    ex.requestedTimeISO,\n  appointmentDuration: ex.appointmentDuration,\n  reason:              ex.reason,\n  calendarId:          ex.calendarId,\n  locationId:          ex.locationId,\n  ghlApiKey:           ex.ghlApiKey,\n  toolCallId:          ex.toolCallId,\n  callerPhone:         ex.callerPhone || ex.testPhone\n}}];"
+      }
+    },
+    {
+      "id": "http-create-contact",
+      "name": "GHL: Create Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1800,
+        760
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/contacts/",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('Extract Tool Call').item.json.ghlApiKey }}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ firstName: ($('Extract Tool Call').item.json.callerName.split(' ')[0] || 'Unknown'), lastName: ($('Extract Tool Call').item.json.callerName.split(' ').slice(1).join(' ') || ''), phone: ($('Extract Tool Call').item.json.callerPhone || $('Extract Tool Call').item.json.testPhone), locationId: $('Extract Tool Call').item.json.locationId, source: 'VAPI Inbound Call' }) }}"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "code-merge-contact",
+      "name": "Set Contact ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        620
+      ],
+      "parameters": {
+        "jsCode": "const inp = $input.item.json;\nconst ex  = $('Extract Tool Call').item.json;\nconst contactId = inp.contactId || inp.contact?.id || inp.id || '';\nreturn [{ json: {\n  contactId,\n  callerName:          ex.callerName,\n  requestedTimeISO:    ex.requestedTimeISO,\n  appointmentDuration: ex.appointmentDuration,\n  reason:              ex.reason,\n  calendarId:          ex.calendarId,\n  locationId:          ex.locationId,\n  ghlApiKey:           ex.ghlApiKey,\n  toolCallId:          ex.toolCallId,\n  callerPhone:         ex.callerPhone || ex.testPhone\n}}];"
+      }
+    },
+    {
+      "id": "http-book",
+      "name": "GHL: Create Appointment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2320,
+        620
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/calendars/events/appointments",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $json.ghlApiKey }}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ calendarId: $json.calendarId, locationId: $json.locationId, contactId: $json.contactId, startTime: $json.requestedTimeISO, endTime: new Date(new Date($json.requestedTimeISO).getTime() + ($json.appointmentDuration || 60) * 60000).toISOString(), title: ($json.callerName || 'Caller') + ' | ' + ($json.reason || 'Appointment') }) }}"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "resp-booked",
+      "name": "Respond: Booked",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2600,
+        470
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ results: [{ toolCallId: $('Extract Tool Call').item.json.toolCallId, result: 'You are all set. Your appointment has been booked. Is there anything else I can help you with?' }] }) }}"
+      }
+    },
+    {
+      "id": "http-note",
+      "name": "GHL: Add Note",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "continueOnFail": true,
+      "position": [
+        2600,
+        810
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://services.leadconnectorhq.com/contacts/' + $('Set Contact ID').item.json.contactId + '/notes/' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('Set Contact ID').item.json.ghlApiKey }}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ body: 'VAPI call: appointment booked by the AI receptionist\\nCaller: ' + $('Set Contact ID').item.json.callerName + '\\nPhone: ' + $('Set Contact ID').item.json.callerPhone + '\\nTime: ' + $('Set Contact ID').item.json.requestedTimeISO + '\\nReason: ' + ($('Set Contact ID').item.json.reason || 'Not specified') }) }}"
+      }
+    },
+    {
+      "id": "resp-failed",
+      "name": "Respond: Book Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2600,
+        640
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ results: [{ toolCallId: $('Extract Tool Call').item.json.toolCallId, result: 'I am sorry, something went wrong with the booking. Please call us back or try a different time.' }] }) }}"
+      }
+    },
+    {
+      "id": "resp-unknown",
+      "name": "Respond: Unknown Tool",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        850
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ results: [{ toolCallId: $json.toolCallId || 'unknown', result: 'I am not sure how to handle that request. Let me transfer you to our team.' }] }) }}"
+      }
+    },
+    {
+      "id": "respond-slots-failed",
+      "name": "Respond: Slots Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1800,
+        -20
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ results: [{ toolCallId: $('Extract Tool Call').item.json.toolCallId, result: 'I am sorry, I am having trouble checking the calendar right now. Could you try again in a moment, or I can have our team call you back?' }] }) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "VAPI Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Extract Tool Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Tool Call": {
+      "main": [
+        [
+          {
+            "node": "Which Tool?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Which Tool?": {
+      "main": [
+        [
+          {
+            "node": "Build Date Range",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GHL: Search Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Unknown Tool",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Date Range": {
+      "main": [
+        [
+          {
+            "node": "GHL: Get Free Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Get Free Slots": {
+      "main": [
+        [
+          {
+            "node": "Format Slots",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Slots Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Slots": {
+      "main": [
+        [
+          {
+            "node": "Respond: Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Search Contact": {
+      "main": [
+        [
+          {
+            "node": "Contact Exists?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Book Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contact Exists?": {
+      "main": [
+        [
+          {
+            "node": "Get Contact ID",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GHL: Create Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Contact ID": {
+      "main": [
+        [
+          {
+            "node": "Set Contact ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Create Contact": {
+      "main": [
+        [
+          {
+            "node": "Set Contact ID",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Book Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Contact ID": {
+      "main": [
+        [
+          {
+            "node": "GHL: Create Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Create Appointment": {
+      "main": [
+        [
+          {
+            "node": "Respond: Booked",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "GHL: Add Note",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Book Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
